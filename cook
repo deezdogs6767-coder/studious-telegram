@@ -1,3 +1,4 @@
+
 """
 FastAPI backend for ProNet (Render-ready)
 - Implements admin-approved signups
@@ -24,6 +25,9 @@ import secrets
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from fastapi import FastAPI
+
+app = FastAPI()
 
 from fastapi import FastAPI, Request, Response, HTTPException, status
 from fastapi.responses import JSONResponse
