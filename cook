@@ -1,0 +1,346 @@
+"""
+FastAPI backend for ProNet (Render-ready)
+- Implements admin-approved signups
+- Session cookie using server-side tokens
+- SQLite persistence (users, pending, pages, posts, sessions)
+- Endpoints matching frontend expectations
+
+How to run locally:
+    pip install -r requirements.txt
+    uvicorn main:app --reload
+
+Deploy on Render:
+- Push repo to GitHub
+- Create Web Service on Render
+- Build Command: pip install -r requirements.txt
+- Start Command: gunicorn -k uvicorn.workers.UvicornWorker main:app
+
+"""
+from __future__ import annotations
+import json
+import os
+import sqlite3
+import secrets
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from fastapi import FastAPI, Request, Response, HTTPException, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+DB_FILE = Path(__file__).parent / "pronet.db"
+SECRET_KEY = os.environ.get("PRONET_SECRET", secrets.token_hex(16))
+SESSION_COOKIE_NAME = "pronet_session"
+
+app = FastAPI()
+
+# --- DB helpers ---
+def get_conn():
+    conn = sqlite3.connect(str(DB_FILE))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.executescript('''
+    CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password TEXT NOT NULL,
+        is_admin INTEGER DEFAULT 0,
+        approved INTEGER DEFAULT 0
+    );
+    CREATE TABLE IF NOT EXISTS pending (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        password TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS pages (
+        key TEXT PRIMARY KEY,
+        title TEXT,
+        body TEXT
+    );
+    CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        author TEXT,
+        content TEXT,
+        ts TEXT
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+        token TEXT PRIMARY KEY,
+        username TEXT,
+        created_at TEXT
+    );
+    ''')
+    conn.commit()
+    conn.close()
+
+
+init_db()
+
+# Seed admin user if missing
+conn = get_conn()
+cur = conn.cursor()
+cur.execute("SELECT COUNT(*) FROM users WHERE username = ?", ("cyrus",))
+if cur.fetchone()[0] == 0:
+    cur.execute("INSERT OR REPLACE INTO users (username,password,is_admin,approved) VALUES (?,?,?,?)",
+                ("cyrus", "runtomeconfess", 1, 1))
+    conn.commit()
+conn.close()
+
+# --- Pydantic models ---
+class LoginIn(BaseModel):
+    username: str
+    password: str
+
+class ReqIn(BaseModel):
+    user: str
+    passw: str
+
+class PagesIn(BaseModel):
+    pages: dict
+
+class PostIn(BaseModel):
+    id: Optional[int]
+    author: Optional[str]
+    content: str
+    ts: Optional[str]
+
+# --- Session helpers ---
+
+def create_session(resp: Response, username: str):
+    token = secrets.token_urlsafe(32)
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("INSERT INTO sessions (token, username, created_at) VALUES (?,?,?)", (token, username, datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    # set cookie
+    resp.set_cookie(SESSION_COOKIE_NAME, token, httponly=True, samesite="lax")
+    return token
+
+
+def get_session_username(request: Request) -> Optional[str]:
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not token:
+        return None
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT username FROM sessions WHERE token = ?", (token,))
+    row = cur.fetchone(); conn.close()
+    return row[0] if row else None
+
+
+def require_login(request: Request):
+    user = get_session_username(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="login required")
+    return user
+
+
+def require_admin(request: Request):
+    user = get_session_username(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="login required")
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT is_admin FROM users WHERE username = ? AND approved = 1", (user,))
+    row = cur.fetchone(); conn.close()
+    if not row or row[0] != 1:
+        raise HTTPException(status_code=403, detail="admin required")
+    return user
+
+# --- API endpoints ---
+@app.post('/api/request')
+def request_account(payload: dict):
+    user = payload.get('user')
+    passwd = payload.get('pass')
+    if not user or not passwd:
+        return JSONResponse({'ok': False, 'error': 'missing'}, status_code=400)
+    conn = get_conn(); cur = conn.cursor()
+    # check existence
+    cur.execute("SELECT username FROM users WHERE username = ?", (user,))
+    if cur.fetchone():
+        conn.close()
+        return {'ok': False, 'error': 'username exists'}
+    cur.execute("INSERT INTO pending (username,password,created_at) VALUES (?,?,?)", (user, passwd, datetime.utcnow().isoformat()))
+    conn.commit(); conn.close()
+    return {'ok': True}
+
+
+@app.get('/api/pending')
+def get_pending(request: Request):
+    try:
+        require_admin(request)
+    except HTTPException:
+        # return empty for unauthenticated client in UI; frontend handles
+        return []
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT id,username,created_at FROM pending ORDER BY id DESC")
+    rows = cur.fetchall(); conn.close()
+    return [dict(id=r['id'], user=r['username'], created_at=r['created_at']) for r in rows]
+
+
+@app.post('/api/approve')
+def approve_pending(payload: dict, request: Request):
+    try: require_admin(request)
+    except HTTPException as e:
+        raise e
+    user = payload.get('user'); passwd = payload.get('pass')
+    if not user or not passwd:
+        raise HTTPException(status_code=400, detail='missing')
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("INSERT OR REPLACE INTO users (username,password,is_admin,approved) VALUES (?,?,?,?)", (user, passwd, 0, 1))
+    cur.execute("DELETE FROM pending WHERE username = ?", (user,))
+    conn.commit(); conn.close()
+    return {'ok': True}
+
+
+@app.post('/api/login')
+def api_login(payload: LoginIn, response: Response):
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT password, is_admin, approved FROM users WHERE username = ?", (payload.username,))
+    row = cur.fetchone()
+    if not row:
+        conn.close(); return JSONResponse({'ok':False,'error':'invalid'}, status_code=401)
+    passwd, is_admin, approved = row['password'], row['is_admin'], row['approved']
+    if approved != 1:
+        conn.close(); return JSONResponse({'ok':False,'error':'pending'}, status_code=403)
+    if passwd != payload.password:
+        conn.close(); return JSONResponse({'ok':False,'error':'invalid'}, status_code=401)
+    # create session cookie
+    token = create_session(response, payload.username)
+    return {'ok': True, 'user': payload.username, 'isAdmin': bool(is_admin)}
+
+
+@app.post('/api/logout')
+def api_logout(request: Request, response: Response):
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    if token:
+        conn = get_conn(); cur = conn.cursor(); cur.execute("DELETE FROM sessions WHERE token = ?", (token,)); conn.commit(); conn.close()
+    response.delete_cookie(SESSION_COOKIE_NAME)
+    return {'ok': True}
+
+
+@app.get('/api/whoami')
+def api_whoami(request: Request):
+    user = get_session_username(request)
+    if not user:
+        return {'ok': False}
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT is_admin FROM users WHERE username = ?", (user,)); row = cur.fetchone(); conn.close()
+    return {'ok': True, 'user': user, 'isAdmin': bool(row['is_admin'])}
+
+
+@app.get('/api/pages')
+def api_pages():
+    conn = get_conn(); cur = conn.cursor()
+    cur.execute("SELECT key,title,body FROM pages")
+    rows = cur.fetchall(); conn.close()
+    if rows:
+        return {r['key']: {'title': r['title'], 'body': r['body']} for r in rows}
+    # seed defaults
+    defaults = {
+        'home': {'title':'Welcome to ProNet','body':'This is your personalized professional dashboard.'},
+        'network': {'title':'My Network','body':'Manage and grow your professional connections.'},
+        'jobs': {'title':'Jobs','body':'Find opportunities tailored to your skills.'},
+        'messaging': {'title':'Messaging','body':'Chat with colleagues, friends and connections.'},
+        'notifications': {'title':'Notifications','body':'Stay updated with the latest alerts.'},
+        'account': {'title':'Account Settings','body':'Manage your personal profile and preferences.'}
+    }
+    # persist defaults
+    conn = get_conn(); cur = conn.cursor()
+    for k,v in defaults.items(): cur.execute("INSERT OR REPLACE INTO pages (key,title,body) VALUES (?,?,?)", (k, v['title'], v['body']))
+    conn.commit(); conn.close()
+    return defaults
+
+
+@app.post('/api/savePages')
+def api_save_pages(payload: PagesIn, request: Request):
+    try: require_admin(request)
+    except HTTPException as e: raise e
+    pages = payload.pages
+    conn = get_conn(); cur = conn.cursor()
+    for k, v in pages.items():
+        title = v.get('title','')
+        body = v.get('body','')
+        cur.execute("INSERT OR REPLACE INTO pages (key,title,body) VALUES (?,?,?)", (k, title, body))
+    conn.commit(); conn.close()
+    return {'ok': True}
+
+
+@app.get('/api/posts')
+def api_posts():
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT id,author,content,ts FROM posts ORDER BY id DESC"); rows = cur.fetchall(); conn.close()
+    return [dict(id=r['id'], author=r['author'], content=r['content'], ts=r['ts']) for r in rows]
+
+
+@app.post('/api/createPost')
+def api_create_post(payload: PostIn, request: Request):
+    user = get_session_username(request)
+    if not user:
+        raise HTTPException(status_code=401, detail='login required')
+    content = payload.content.strip()
+    if not content:
+        raise HTTPException(status_code=400, detail='empty')
+    ts = datetime.utcnow().isoformat()
+    conn = get_conn(); cur = conn.cursor(); cur.execute("INSERT INTO posts (author,content,ts) VALUES (?,?,?)", (user, content, ts)); conn.commit(); conn.close()
+    return {'ok': True}
+
+
+@app.post('/api/editPost')
+def api_edit_post(payload: PostIn, request: Request):
+    user = get_session_username(request)
+    if not user:
+        raise HTTPException(status_code=401, detail='login required')
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT author FROM posts WHERE id = ?", (payload.id,)); row = cur.fetchone()
+    if not row:
+        conn.close(); raise HTTPException(status_code=404, detail='not found')
+    author = row['author']
+    # allow author or admin
+    cur.execute("SELECT is_admin FROM users WHERE username = ?", (user,)); r2 = cur.fetchone(); is_admin = bool(r2 and r2['is_admin'])
+    if author != user and not is_admin:
+        conn.close(); raise HTTPException(status_code=403, detail='forbidden')
+    cur.execute("UPDATE posts SET content = ? WHERE id = ?", (payload.content, payload.id)); conn.commit(); conn.close()
+    return {'ok': True}
+
+
+@app.post('/api/deletePost')
+def api_delete_post(payload: dict, request: Request):
+    user = get_session_username(request)
+    if not user:
+        raise HTTPException(status_code=401, detail='login required')
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT author FROM posts WHERE id = ?", (payload.get('id'),)); row = cur.fetchone()
+    if not row:
+        conn.close(); raise HTTPException(status_code=404, detail='not found')
+    cur.execute("SELECT is_admin FROM users WHERE username = ?", (user,)); r2 = cur.fetchone(); is_admin = bool(r2 and r2['is_admin'])
+    if not is_admin:
+        conn.close(); raise HTTPException(status_code=403, detail='admin required')
+    cur.execute("DELETE FROM posts WHERE id = ?", (payload.get('id'),)); conn.commit(); conn.close()
+    return {'ok': True}
+
+
+# Simple endpoints to support the UI
+@app.get('/api/users')
+def api_users():
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT username,is_admin,approved FROM users"); rows = cur.fetchall(); conn.close()
+    return {r['username']: {'isAdmin': bool(r['is_admin']), 'approved': bool(r['approved'])} for r in rows}
+
+@app.get('/api/whoami-fast')
+def whoami_fast(request: Request):
+    user = get_session_username(request)
+    if not user: return {'ok': False}
+    conn = get_conn(); cur = conn.cursor(); cur.execute("SELECT is_admin FROM users WHERE username = ?", (user,)); r = cur.fetchone(); conn.close()
+    return {'ok': True, 'user': user, 'isAdmin': bool(r and r['is_admin'])}
+
+@app.post('/api/approve')
+def api_approve(payload: dict, request: Request):
+    # duplicate approve endpoint in case UI uses it
+    return approve_pending(payload, request)
+
+# health
+@app.get('/health')
+def health():
+    return {'ok': True}
+
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run('main:app', host='0.0.0.0', port=8000, reload=True)
